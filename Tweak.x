@@ -1,15 +1,12 @@
-// WatusiJetsamUncap
+// WatusiJetsamUncap v1.2.0
 // Made by 551
 //
-// Removes WhatsApp/Watusi's custom per-process Jetsam memory ceilings by
-// rewriting RunningBoard's memlimit assignments to <= 0. On iOS/XNU this
-// means: no custom high-water mark / per-task limit; use the normal system-wide
-// task memory limit instead. Global system memory-pressure Jetsam still works.
+// Raises WhatsApp's notification ServiceExtension custom Jetsam memory limit
+// to 512 MiB. This deliberately uses the same runningboardd ->
+// memorystatus_control interception point as known working WhatsApp Jetsam
+// fixes, but uses a high ceiling instead of -1/default-limit semantics.
 //
-// The primary reason for this tweak is WhatsApp's ServiceExtension. Watusi can
-// increase that extension's footprint enough for the stock extension-specific
-// cap to terminate it, causing delayed/missing incoming messages until the
-// extension is launched again.
+// Global iOS memory-pressure Jetsam remains untouched.
 
 #import <Foundation/Foundation.h>
 #import <substrate.h>
@@ -22,14 +19,13 @@
 #include <mach-o/dyld.h>
 
 #define PROC_PIDPATHINFO_MAXSIZE 4096
+#define WJU_TARGET_MIB 512
 
-// XNU memorystatus_control commands used to set per-process memory ceilings.
 #define MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK 5
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT      6
 #define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES    7
-#define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL            0x1
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES    8
 
-// iOS 16 structure used with MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES.
 typedef struct memorystatus_memlimit_properties {
     int32_t  memlimit_active;
     uint32_t memlimit_active_attr;
@@ -65,87 +61,59 @@ static const char *basename_ptr(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-static bool range_contains(const char *start, size_t length, const char *needle) {
-    if (!start || !needle) return false;
-    size_t nlen = strlen(needle);
-    if (nlen == 0 || nlen > length) return false;
-
-    for (size_t i = 0; i + nlen <= length; i++) {
-        if (memcmp(start + i, needle, nlen) == 0) return true;
-    }
-    return false;
-}
-
-static bool path_is_whatsapp_or_watusi_bundle(const char *path) {
-    if (!path || !strstr(path, ".app/")) return false;
-
-    // Standard WhatsApp / Watusi-on-App-Store-WhatsApp installation.
-    if (strstr(path, "/WhatsApp.app/")) return true;
-
-    // WhatsApp Business and common duplicate/renamed Watusi bundles.
-    if (strstr(path, "/WhatsApp Business.app/")) return true;
-    if (strstr(path, "/Watusi.app/")) return true;
-
-    // Tolerate duplicate packaging that keeps WhatsApp/Watusi in the bundle
-    // name but does not use one of the exact names above.
-    const char *app = strstr(path, ".app/");
-    if (app) {
-        // Only inspect the app bundle name itself. Do not let a later path
-        // component such as an extension name cause a false-positive match.
-        const char *bundleStart = app;
-        while (bundleStart > path && bundleStart[-1] != '/') bundleStart--;
-        size_t bundleNameLen = (size_t)(app - bundleStart);
-
-        if (range_contains(bundleStart, bundleNameLen, "WhatsApp") ||
-            range_contains(bundleStart, bundleNameLen, "Watusi")) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool path_is_supported_target(const char *path) {
-    if (!path_is_whatsapp_or_watusi_bundle(path)) return false;
+static bool is_service_extension_path(const char *path) {
+    if (!path) return false;
 
     const char *base = basename_ptr(path);
-    if (!base) return false;
+    if (!base || strcmp(base, "ServiceExtension") != 0) return false;
+    if (!strstr(path, "/ServiceExtension.appex/ServiceExtension")) return false;
 
-    // Main application process.
-    if (strcmp(base, "WhatsApp") == 0 ||
-        strcmp(base, "WhatsApp Business") == 0 ||
-        strcmp(base, "Watusi") == 0) {
+    if (strstr(path, "/WhatsApp.app/") ||
+        strstr(path, "/WhatsApp Business.app/") ||
+        strstr(path, "/Watusi.app/")) {
         return true;
     }
 
-    // WhatsApp extensions. ServiceExtension is the critical target for
-    // incoming message handling / notification decryption.
-    if (strcmp(base, "ServiceExtension") == 0 &&
-        strstr(path, "/ServiceExtension.appex/")) {
-        return true;
-    }
-
-    if (strcmp(base, "NotificationExtension") == 0 &&
-        strstr(path, "/NotificationExtension.appex/")) {
-        return true;
-    }
-
-    if (strcmp(base, "ShareExtension") == 0 &&
-        strstr(path, "/ShareExtension.appex/")) {
+    if (strstr(path, ".app/") &&
+        (strstr(path, "/WhatsApp") || strstr(path, "/Watusi"))) {
         return true;
     }
 
     return false;
 }
 
-static bool get_target_path(int32_t pid, char path[PROC_PIDPATHINFO_MAXSIZE]) {
+static bool get_service_extension_path(int32_t pid,
+                                       char path[PROC_PIDPATHINFO_MAXSIZE]) {
     if (pid < 2) return false;
 
     memset(path, 0, PROC_PIDPATHINFO_MAXSIZE);
     int n = proc_pidpath(pid, path, PROC_PIDPATHINFO_MAXSIZE);
     if (n <= 0) return false;
 
-    return path_is_supported_target(path);
+    return is_service_extension_path(path);
+}
+
+static void log_effective_limit(int32_t pid, const char *path) {
+    memorystatus_memlimit_properties_t verify = {0};
+    int rv = orig_memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
+                                       pid,
+                                       0,
+                                       &verify,
+                                       sizeof(verify));
+
+    if (rv == 0) {
+        os_log(wju_log(),
+               "VERIFY %{public}s pid=%d effective active=%d inactive=%d activeAttr=0x%x inactiveAttr=0x%x",
+               path, pid,
+               verify.memlimit_active,
+               verify.memlimit_inactive,
+               verify.memlimit_active_attr,
+               verify.memlimit_inactive_attr);
+    } else {
+        os_log_error(wju_log(),
+                     "VERIFY FAILED %{public}s pid=%d rv=%d",
+                     path, pid, rv);
+    }
 }
 
 static int hooked_memorystatus_control(uint32_t command,
@@ -153,58 +121,69 @@ static int hooked_memorystatus_control(uint32_t command,
                                        uint32_t flags,
                                        void *buffer,
                                        size_t buffersize) {
-    char path[PROC_PIDPATHINFO_MAXSIZE];
-
-    // Don't do the proc lookup for unrelated memorystatus operations.
     bool isLimitCommand =
         command == MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES ||
         command == MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK ||
         command == MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT;
 
-    if (!isLimitCommand || !get_target_path(pid, path)) {
+    if (!isLimitCommand) {
         return orig_memorystatus_control(command, pid, flags, buffer, buffersize);
     }
 
-    // Primary iOS 15/16 path: active/inactive limits are supplied in a struct.
-    // Use a local copy so RunningBoard's original buffer is never mutated.
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if (!get_service_extension_path(pid, path)) {
+        return orig_memorystatus_control(command, pid, flags, buffer, buffersize);
+    }
+
     if (command == MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES) {
-        if (buffer != NULL && buffersize == sizeof(memorystatus_memlimit_properties_t)) {
-            memorystatus_memlimit_properties_t original =
-                *(memorystatus_memlimit_properties_t *)buffer;
-            memorystatus_memlimit_properties_t local = original;
-
-            // XNU interprets <= 0 as "no custom HWM / no per-task custom limit"
-            // and installs the normal system-wide task limit instead.
-            local.memlimit_active = -1;
-            local.memlimit_inactive = -1;
-            local.memlimit_active_attr = MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
-            local.memlimit_inactive_attr = MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
-
-            int rv = orig_memorystatus_control(command, pid, flags,
-                                               &local, sizeof(local));
-            os_log(wju_log(),
-                   "UNCAPPED %{public}s pid=%d cmd=7 active=%d inactive=%d -> system task limit (rv=%d)",
-                   path, pid, original.memlimit_active,
-                   original.memlimit_inactive, rv);
-            return rv;
+        if (buffer == NULL || buffersize != sizeof(memorystatus_memlimit_properties_t)) {
+            os_log_error(wju_log(),
+                         "UNEXPECTED cmd=7 layout %{public}s pid=%d size=%lu; passing through",
+                         path, pid, (unsigned long)buffersize);
+            return orig_memorystatus_control(command, pid, flags, buffer, buffersize);
         }
 
-        // Unknown layout: fail open rather than pretending success. This avoids
-        // breaking RunningBoard if Apple changes the ABI on another iOS build.
-        os_log_error(wju_log(),
-                     "Target %{public}s pid=%d used unexpected cmd=7 buffer size=%{public}lu; passing through",
-                     path, pid, (unsigned long)buffersize);
-        return orig_memorystatus_control(command, pid, flags, buffer, buffersize);
+        memorystatus_memlimit_properties_t original =
+            *(memorystatus_memlimit_properties_t *)buffer;
+        memorystatus_memlimit_properties_t local = original;
+
+        if (local.memlimit_active > 0 && local.memlimit_active < WJU_TARGET_MIB) {
+            local.memlimit_active = WJU_TARGET_MIB;
+        }
+        if (local.memlimit_inactive > 0 && local.memlimit_inactive < WJU_TARGET_MIB) {
+            local.memlimit_inactive = WJU_TARGET_MIB;
+        }
+
+        int rv = orig_memorystatus_control(command, pid, flags,
+                                           &local, sizeof(local));
+
+        os_log(wju_log(),
+               "SET %{public}s pid=%d cmd=7 requested active=%d inactive=%d -> active=%d inactive=%d rv=%d",
+               path, pid,
+               original.memlimit_active,
+               original.memlimit_inactive,
+               local.memlimit_active,
+               local.memlimit_inactive,
+               rv);
+
+        if (rv == 0) log_effective_limit(pid, path);
+        return rv;
     }
 
-    // Legacy/single-value path. XNU reads the requested MiB limit from flags as
-    // int32_t. UINT32_MAX therefore becomes -1 and selects the system task limit.
-    int32_t oldLimit = (int32_t)flags;
-    int rv = orig_memorystatus_control(command, pid, UINT32_MAX,
+    int32_t requested = (int32_t)flags;
+    uint32_t replacement = flags;
+    if (requested > 0 && requested < WJU_TARGET_MIB) {
+        replacement = (uint32_t)WJU_TARGET_MIB;
+    }
+
+    int rv = orig_memorystatus_control(command, pid, replacement,
                                        buffer, buffersize);
+
     os_log(wju_log(),
-           "UNCAPPED %{public}s pid=%d cmd=%u limit=%d -> system task limit (rv=%d)",
-           path, pid, command, oldLimit, rv);
+           "SET %{public}s pid=%d cmd=%u requested=%d -> %d rv=%d",
+           path, pid, command, requested, (int32_t)replacement, rv);
+
+    if (rv == 0) log_effective_limit(pid, path);
     return rv;
 }
 
@@ -226,6 +205,7 @@ static bool running_inside_runningboardd(void) {
                        (void **)&orig_memorystatus_control);
 
         os_log(wju_log(),
-               "WatusiJetsamUncap loaded in runningboardd; WhatsApp/Watusi custom memlimits will be replaced with the system task limit");
+               "WatusiJetsamUncap v1.2.0 loaded in runningboardd; ServiceExtension target=%d MiB",
+               WJU_TARGET_MIB);
     }
 }

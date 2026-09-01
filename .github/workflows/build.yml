@@ -30,11 +30,12 @@ jobs:
         run: |
           set -euo pipefail
           grep -q '^Package: com.551.watusijetsamuncap$' control
-          grep -q '^Version: 1.1.0$' control
-          grep -q 'ServiceExtension' Tweak.x
+          grep -q '^Version: 1.2.0$' control
+          grep -q '#define WJU_TARGET_MIB 512' Tweak.x
+          grep -q 'ServiceExtension.appex/ServiceExtension' Tweak.x
           grep -q 'MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES' Tweak.x
-          grep -q 'memlimit_active = -1' Tweak.x
-          grep -q 'memlimit_inactive = -1' Tweak.x
+          grep -q 'MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES' Tweak.x
+          grep -q 'log_effective_limit' Tweak.x
 
       - name: Build rootless DEB
         shell: bash
@@ -54,12 +55,14 @@ jobs:
 
           ARCH=$(dpkg-deb -f "$DEB" Architecture)
           PACKAGE=$(dpkg-deb -f "$DEB" Package)
+          VERSION=$(dpkg-deb -f "$DEB" Version)
           test "$ARCH" = 'iphoneos-arm64'
           test "$PACKAGE" = 'com.551.watusijetsamuncap'
+          test "$VERSION" = '1.2.0'
 
       - name: Upload compiled DEB
         uses: actions/upload-artifact@v4
         with:
-          name: WatusiJetsamUncap-rootless-DEB
+          name: WatusiJetsamUncap-v1.2.0-rootless-DEB
           path: packages/*.deb
           if-no-files-found: error
