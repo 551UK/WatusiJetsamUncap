@@ -1,0 +1,65 @@
+name: Build WatusiJetsamUncap
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        uses: beerpiss/theos-action@v1
+        with:
+          theos-sdks: https://github.com/theos/sdks
+
+      - name: Install Debian packaging tools
+        run: brew install dpkg
+
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q '^Package: com.551.watusijetsamuncap$' control
+          grep -q '^Version: 1.1.0$' control
+          grep -q 'ServiceExtension' Tweak.x
+          grep -q 'MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES' Tweak.x
+          grep -q 'memlimit_active = -1' Tweak.x
+          grep -q 'memlimit_inactive = -1' Tweak.x
+
+      - name: Build rootless DEB
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .theos packages
+          THEOS_PACKAGE_SCHEME=rootless make clean
+          THEOS_PACKAGE_SCHEME=rootless \
+          THEOS_PLATFORM_DEB_COMPRESSION_TYPE=gzip \
+          THEOS_PLATFORM_DEB_COMPRESSION_LEVEL=6 \
+          make package FINALPACKAGE=1 \
+          _THEOS_PLATFORM_DPKG_DEB="$(command -v dpkg-deb)"
+
+          DEB=$(find packages -type f -name '*.deb' | head -n 1)
+          test -n "$DEB"
+          dpkg-deb --info "$DEB"
+
+          ARCH=$(dpkg-deb -f "$DEB" Architecture)
+          PACKAGE=$(dpkg-deb -f "$DEB" Package)
+          test "$ARCH" = 'iphoneos-arm64'
+          test "$PACKAGE" = 'com.551.watusijetsamuncap'
+
+      - name: Upload compiled DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: WatusiJetsamUncap-rootless-DEB
+          path: packages/*.deb
+          if-no-files-found: error
