@@ -1,0 +1,10 @@
+Package: com.551.watusijetsamuncap
+Name: WatusiJetsamUncap
+Version: 1.1.0
+Architecture: iphoneos-arm64
+Description: Removes custom per-process Jetsam memory ceilings from WhatsApp/Watusi processes and extensions, especially ServiceExtension, while preserving iOS system-wide memory-pressure protection. Userspace reboot required after install/uninstall.
+Maintainer: 551
+Author: 551
+Section: Tweaks
+Depends: ellekit
+Conflicts: com.0xkuj.fixwanotifs, com.0xkuj.fixwanotifications16, com.551.watusijetsamoff
